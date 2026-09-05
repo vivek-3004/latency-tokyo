@@ -1,204 +1,275 @@
-// agent.js — Deploy as 12 separate Web Services on Render
-// Each with different NODE_ID env var
-
+import dgram from 'dgram';
 import https from 'https';
+import http from 'http';
+import { performance } from 'perf_hooks';
 import dns from 'dns/promises';
-import net from 'net';
-import { WebSocket } from 'ws';
-import { createServer } from 'http'; 
+import tls from 'tls';
 
-
-// ─── CONFIG FROM ENV ───
+// ─── CONFIG ───
 const NODE_ID = process.env.NODE_ID || 'tokyo';
-const CENTRAL_URL = process.env.CENTRAL_WS_URL || 'wss://latency-central.onrender.com';
-const PEERS = JSON.parse(process.env.PEER_IDS || `["mumbai","delhi","singapore","sydney","dubai","london","frankfurt","virginia","california","brazil","southafrica"]`);
+const REGION = process.env.REGION || 'Asia';
+const CENTRAL_WS = process.env.CENTRAL_WS || 'wss://latency-central.onrender.com/ws';
 const PROBE_INTERVAL = parseInt(process.env.PROBE_INTERVAL || '10000'); // 10s
-const PROBE_TIMEOUT = 3000;
 const PORT = process.env.PORT || 10000;
 
-console.log(`[${NODE_ID}] Starting — Peers: ${PEERS.join(', ')}`);
-console.log(`[${NODE_ID}] Central: ${CENTRAL_URL}`);
+// ─── PEER NODES TO PROBE ───
+const PEERS = [
+  'mumbai', 'delhi', 'singapore', 'tokyo', 'sydney',
+  'dubai', 'london', 'frankfurt', 'virginia', 'california',
+  'brazil', 'southafrica'
+].filter(p => p !== NODE_ID);
 
-// ─── STATE ───
-let ws = null;
-let reconnectTimer = null;
-let probeTimer = null;
+// Probe targets (HTTP endpoints on peer nodes)
+const PROBE_TARGETS = PEERS.map(peer => ({
+  id: peer,
+  host: `latency-${peer}.onrender.com`,
+  port: 443,
+  path: '/probe'
+}));
 
-// ─── WEBSOCKET CONNECTION ───
-function connect() {
-  ws = new WebSocket(CENTRAL_URL);
+// ─── HTTP SERVER (REQUIRED BY RENDER) ───
+const server = http.createServer((req, res) => {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  ws.on('open', () => {
-    console.log(`[${NODE_ID}] Connected to central`);
-    ws.send(JSON.stringify({ type: 'register-node', nodeId: NODE_ID }));
-    
-    // Start probing
-    if (probeTimer) clearInterval(probeTimer);
-    probeTimer = setInterval(probeAllPeers, PROBE_INTERVAL);
-    probeAllPeers(); // immediate first probe
-  });
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
 
-  ws.on('close', () => {
-    console.log(`[${NODE_ID}] Disconnected, reconnecting in 5s...`);
-    if (probeTimer) clearInterval(probeTimer);
-    reconnectTimer = setTimeout(connect, 5000);
-  });
-
-  ws.on('error', (err) => {
-    console.error(`[${NODE_ID}] WS Error:`, err.message);
-  });
-}
-
-connect();
-
-// ─── HEALTH CHECK HTTP SERVER (required by Render) ───
-const healthServer = createServer((req, res) => {
-  if (req.url === '/health') {
+  // Root — status page
+  if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-      status: 'ok', 
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'latency-probe',
       nodeId: NODE_ID,
-      centralConnected: ws?.readyState === WebSocket.OPEN,
-      uptime: process.uptime()
+      region: REGION,
+      uptime: process.uptime(),
+      wsConnected: ws && ws.readyState === 1,
+      lastProbes: probeHistory.slice(-5),
+      endpoints: {
+        root: '/',
+        health: '/health',
+        probe: '/probe',
+        stats: '/stats'
+      }
+    }, null, 2));
+    return;
+  }
+
+  // Probe endpoint — used by OTHER nodes to measure latency TO this node
+  if (req.url === '/probe') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      nodeId: NODE_ID,
+      region: REGION,
+      timestamp: Date.now()
     }));
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
+    return;
   }
-});
 
-healthServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`[${NODE_ID}] Health server listening on port ${PORT}`);
-});
-
-// ─── UPDATE GRACEFUL SHUTDOWN ███
-process.on('SIGTERM', () => {
-  console.log(`[${NODE_ID}] SIGTERM received, shutting down...`);
-  if (probeTimer) clearInterval(probeTimer);
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (ws) ws.close();
-  healthServer.close(() => process.exit(0));  // ███ CHANGED
-});
-
-// ─── GRACEFUL SHUTDOWN (Render sends SIGTERM) ───
-process.on('SIGTERM', () => {
-  console.log(`[${NODE_ID}] SIGTERM received, shutting down...`);
-  if (probeTimer) clearInterval(probeTimer);
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (ws) ws.close();
-  process.exit(0);
-});
-
-// ─── PROBE ALL PEERS ───
-async function probeAllPeers() {
-  for (const peer of PEERS) {
-    if (peer === NODE_ID) continue;
-    
-    const peerHost = `${peer}.onrender.com`; // Render default domain pattern
-    const result = await measurePeer(peer, peerHost);
-    
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'probe-result',
-        from: NODE_ID,
-        to: peer,
-        timestamp: Date.now(),
-        ...result
-      }));
-    }
+  // Stats endpoint
+  if (req.url === '/stats') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      nodeId: NODE_ID,
+      region: REGION,
+      totalProbes: probeHistory.length,
+      avgLatency: avgLatency(),
+      uptime: process.uptime(),
+      wsConnected: ws && ws.readyState === 1
+    }, null, 2));
+    return;
   }
-}
 
-// ─── MEASURE SINGLE PEER ───
-async function measurePeer(peerId, host) {
-  const results = {};
+  // 404
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ 
+    error: 'Not Found',
+    nodeId: NODE_ID,
+    endpoints: ['/', '/health', '/probe', '/stats']
+  }));
+});
 
-  // Run all probes in parallel
-  const [latency, dns, tls, http] = await Promise.allSettled([
-    tcpPing(host, 443),
-    measureDNS(host),
-    measureTLS(host),
-    measureHTTP(`https://${host}`)
-  ]);
+// ─── WEBSOCKET CLIENT (CONNECTS TO CENTRAL) ───
+let ws = null;
+let reconnectAttempts = 0;
+const probeHistory = [];
 
-  results.latency = latency.status === 'fulfilled' ? latency.value : -1;
-  results.dns = dns.status === 'fulfilled' ? dns.value : -1;
-  results.tls = tls.status === 'fulfilled' ? tls.value : { handshakeMs: -1, valid: false };
-  results.http = http.status === 'fulfilled' ? http.value : { status: 0, ms: -1 };
+function connectWS() {
+  console.log(`[${NODE_ID}] Connecting to ${CENTRAL_WS}...`);
+  ws = new WebSocket(CENTRAL_WS);
 
-  return results;
-}
-
-// ─── TCP PING (Latency) ───
-function tcpPing(host, port) {
-  return new Promise((resolve) => {
-    const start = process.hrtime.bigint();
-    const socket = new net.Socket();
-    socket.setTimeout(PROBE_TIMEOUT);
+  ws.onopen = () => {
+    console.log(`[${NODE_ID}] ✓ Connected to central`);
+    reconnectAttempts = 0;
     
-    socket.connect(port, host, () => {
-      const ms = Number(process.hrtime.bigint() - start) / 1e6;
-      socket.destroy();
-      resolve(Math.round(ms * 10) / 10); // 0.1ms precision
-    });
-    
-    socket.on('error', () => resolve(-1));
-    socket.on('timeout', () => { socket.destroy(); resolve(-1); });
-  });
+    // Register as a node
+    ws.send(JSON.stringify({
+      type: 'register-node',
+      nodeId: NODE_ID,
+      region: REGION,
+      peers: PEERS
+    }));
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'pong') {
+        // Heartbeat response
+      }
+    } catch (e) {}
+  };
+
+  ws.onclose = () => {
+    console.log(`[${NODE_ID}] ✗ Disconnected, reconnecting...`);
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+    reconnectAttempts++;
+    setTimeout(connectWS, delay);
+  };
+
+  ws.onerror = (err) => {
+    console.error(`[${NODE_ID}] WS error:`, err.message);
+  };
 }
 
-// ─── DNS RESOLUTION TIME ───
-async function measureDNS(host) {
-  const start = Date.now();
+// ─── PROBE FUNCTIONS ───
+async function probeHTTP(target) {
+  const start = performance.now();
+  const dnsStart = performance.now();
+  
   try {
-    await dns.resolve4(host);
-    return Date.now() - start;
-  } catch {
-    return -1;
+    // DNS lookup
+    const dnsResult = await dns.lookup(target.host);
+    const dnsTime = performance.now() - dnsStart;
+    
+    // HTTPS request
+    const tlsStart = performance.now();
+    const result = await httpsRequest(target);
+    const tlsTime = performance.now() - tlsStart;
+    
+    const totalTime = performance.now() - start;
+    
+    return {
+      from: NODE_ID,
+      to: target.id,
+      latency: totalTime,
+      dns: dnsTime,
+      tls: { time: tlsTime, valid: result.valid },
+      timestamp: Date.now(),
+      status: 'success'
+    };
+  } catch (err) {
+    return {
+      from: NODE_ID,
+      to: target.id,
+      latency: -1,
+      dns: -1,
+      tls: { valid: false },
+      timestamp: Date.now(),
+      status: 'error',
+      error: err.message
+    };
   }
 }
 
-// ─── TLS HANDSHAKE + CERT ───
-function measureTLS(host) {
-  return new Promise((resolve) => {
-    const start = Date.now();
+function httpsRequest(target) {
+  return new Promise((resolve, reject) => {
+    const start = performance.now();
     const req = https.request({
-      hostname: host,
-      port: 443,
-      method: 'HEAD',
-      timeout: PROBE_TIMEOUT,
-      rejectUnauthorized: false // We check cert ourselves
+      host: target.host,
+      port: target.port,
+      path: target.path,
+      method: 'GET',
+      timeout: 5000,
+      agent: new https.Agent({
+        rejectUnauthorized: false, // Render uses valid certs anyway
+        keepAlive: true
+      })
     }, (res) => {
-      const cert = res.socket.getPeerCertificate();
-      const valid = res.socket.authorized && cert && cert.valid_to;
-      const daysLeft = valid ? Math.ceil((new Date(cert.valid_to) - Date.now()) / 86400000) : -1;
-      
-      resolve({
-        handshakeMs: Date.now() - start,
-        valid,
-        issuer: cert.issuer?.O || 'unknown',
-        daysUntilExpiry: daysLeft
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          resolve({ valid: true, statusCode: res.statusCode });
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}`));
+        }
       });
     });
-    
-    req.on('error', () => resolve({ handshakeMs: -1, valid: false, issuer: 'error', daysUntilExpiry: -1 }));
-    req.on('timeout', () => { req.destroy(); resolve({ handshakeMs: -1, valid: false, issuer: 'timeout', daysUntilExpiry: -1 }); });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('timeout'));
+    });
     req.end();
   });
 }
 
-// ─── HTTP REACHABILITY ───
-function measureHTTP(url) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    const req = https.get(url, { timeout: PROBE_TIMEOUT }, (res) => {
-      let data = '';
-      res.on('data', () => {});
-      res.on('end', () => {
-        resolve({ status: res.statusCode, ms: Date.now() - start });
-      });
-    });
-    req.on('error', () => resolve({ status: 0, ms: -1 }));
-    req.on('timeout', () => { req.destroy(); resolve({ status: 0, ms: -1 }); });
+// ─── PROBE LOOP ───
+async function runProbes() {
+  console.log(`[${NODE_ID}] Probing ${PROBE_TARGETS.length} peers...`);
+  
+  const results = await Promise.all(
+    PROBE_TARGETS.map(target => probeHTTP(target))
+  );
+
+  results.forEach(result => {
+    probeHistory.push(result);
+    if (probeHistory.length > 100) probeHistory.shift();
+    
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'probe-result',
+        ...result
+      }));
+    }
+    
+    if (result.latency > 0) {
+      console.log(`[${NODE_ID}] → ${result.to}: ${result.latency.toFixed(1)}ms`);
+    } else {
+      console.log(`[${NODE_ID}] → ${result.to}: FAILED (${result.error})`);
+    }
   });
 }
+
+function avgLatency() {
+  const valid = probeHistory.filter(p => p.latency > 0);
+  if (valid.length === 0) return 0;
+  return valid.reduce((a, b) => a + b.latency, 0) / valid.length;
+}
+
+// ─── HEARTBEAT ───
+setInterval(() => {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'ping' }));
+  }
+}, 30000);
+
+// ─── START ───
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Probe node [${NODE_ID}] running on port ${PORT}`);
+  console.log(`   Region: ${REGION}`);
+  console.log(`   Peers: ${PEERS.length}`);
+  console.log(`   Central: ${CENTRAL_WS}`);
+});
+
+connectWS();
+
+// Initial probe after 2s (let WS connect first)
+setTimeout(runProbes, 2000);
+
+// Probe loop
+setInterval(runProbes, PROBE_INTERVAL);
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down...');
+  server.close(() => process.exit(0));
+});
